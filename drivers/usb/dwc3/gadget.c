@@ -1700,7 +1700,6 @@ static int __dwc3_gadget_get_frame(struct dwc3 *dwc)
  */
 static int __dwc3_stop_active_transfer(struct dwc3_ep *dep, bool force, bool interrupt)
 {
-	struct dwc3 *dwc = dep->dwc;
 	struct dwc3_gadget_ep_cmd_params params;
 	u32 cmd;
 	int ret;
@@ -1725,8 +1724,7 @@ static int __dwc3_stop_active_transfer(struct dwc3_ep *dep, bool force, bool int
 	dep->resource_index = 0;
 
 	if (!interrupt) {
-		if (!DWC3_IP_IS(DWC3) || DWC3_VER_IS_PRIOR(DWC3, 310A))
-			mdelay(1);
+		mdelay(1);
 		dep->flags &= ~DWC3_EP_TRANSFER_STARTED;
 	} else if (!ret) {
 		dep->flags |= DWC3_EP_END_TRANSFER_PENDING;
@@ -2526,6 +2524,8 @@ static int dwc3_gadget_run_stop(struct dwc3 *dwc, int is_on)
 	return 0;
 }
 
+static void dwc3_gadget_disable_irq(struct dwc3 *dwc);
+static void __dwc3_gadget_stop(struct dwc3 *dwc);
 static int __dwc3_gadget_start(struct dwc3 *dwc);
 
 static int dwc3_gadget_soft_disconnect(struct dwc3 *dwc)
@@ -2588,21 +2588,6 @@ static int dwc3_gadget_soft_disconnect(struct dwc3 *dwc)
 	return dwc3_gadget_run_stop(dwc, false);
 }
 
-static int dwc3_gadget_soft_connect(struct dwc3 *dwc)
-{
-	/*
-	 * In the Synopsys DWC_usb31 1.90a programming guide section
-	 * 4.1.9, it specifies that for a reconnect after a
-	 * device-initiated disconnect requires a core soft reset
-	 * (DCTL.CSftRst) before enabling the run/stop bit.
-	 */
-	dwc3_core_soft_reset(dwc);
-
-	dwc3_event_buffers_setup(dwc);
-	__dwc3_gadget_start(dwc);
-	return dwc3_gadget_run_stop(dwc, true);
-}
-
 static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)
 {
 	struct dwc3		*dwc = gadget_to_dwc(g);
@@ -2642,11 +2627,25 @@ static int dwc3_gadget_pullup(struct usb_gadget *g, int is_on)
 
 	synchronize_irq(dwc->irq_gadget);
 
-	if (!is_on)
+	if (!is_on) {
 		ret = dwc3_gadget_soft_disconnect(dwc);
-	else
-		ret = dwc3_gadget_soft_connect(dwc);
+	} else {
+		/*
+		 * In the Synopsys DWC_usb31 1.90a programming guide section
+		 * 4.1.9, it specifies that for a reconnect after a
+		 * device-initiated disconnect requires a core soft reset
+		 * (DCTL.CSftRst) before enabling the run/stop bit.
+		 */
+		ret = dwc3_core_soft_reset(dwc);
+		if (ret)
+			goto done;
 
+		dwc3_event_buffers_setup(dwc);
+		__dwc3_gadget_start(dwc);
+		ret = dwc3_gadget_run_stop(dwc, true);
+	}
+
+done:
 	pm_runtime_put(dwc->dev);
 
 	return ret;
@@ -2673,6 +2672,12 @@ static void dwc3_gadget_enable_irq(struct dwc3 *dwc)
 		reg |= DWC3_DEVTEN_U3L2L1SUSPEN;
 
 	dwc3_writel(dwc->regs, DWC3_DEVTEN, reg);
+}
+
+static void dwc3_gadget_disable_irq(struct dwc3 *dwc)
+{
+	/* mask all interrupts */
+	dwc3_writel(dwc->regs, DWC3_DEVTEN, 0x00);
 }
 
 static irqreturn_t dwc3_interrupt(int irq, void *_dwc);
@@ -2823,6 +2828,13 @@ static int dwc3_gadget_start(struct usb_gadget *g,
 	spin_unlock_irqrestore(&dwc->lock, flags);
 
 	return 0;
+}
+
+static void __dwc3_gadget_stop(struct dwc3 *dwc)
+{
+	dwc3_gadget_disable_irq(dwc);
+	__dwc3_gadget_ep_disable(dwc->eps[0]);
+	__dwc3_gadget_ep_disable(dwc->eps[1]);
 }
 
 static int dwc3_gadget_stop(struct usb_gadget *g)
@@ -3827,6 +3839,13 @@ static void dwc3_gadget_disconnect_interrupt(struct dwc3 *dwc)
 	usb_gadget_set_state(dwc->gadget, USB_STATE_NOTATTACHED);
 
 	dwc3_ep0_reset_state(dwc);
+
+	/*
+	 * Request PM idle to address condition where usage count is
+	 * already decremented to zero, but waiting for the disconnect
+	 * interrupt to set dwc->connected to FALSE.
+	 */
+	pm_request_idle(dwc->dev);
 }
 
 static void dwc3_gadget_reset_interrupt(struct dwc3 *dwc)
@@ -4535,37 +4554,40 @@ void dwc3_gadget_exit(struct dwc3 *dwc)
 int dwc3_gadget_suspend(struct dwc3 *dwc)
 {
 	unsigned long flags;
-	int ret;
 
-	ret = dwc3_gadget_soft_disconnect(dwc);
-	if (ret)
-		goto err;
+	dwc3_gadget_run_stop(dwc, false);
 
 	spin_lock_irqsave(&dwc->lock, flags);
 	if (dwc->gadget_driver)
 		dwc3_disconnect_gadget(dwc);
+	__dwc3_gadget_stop(dwc);
 	spin_unlock_irqrestore(&dwc->lock, flags);
 
 	return 0;
-
-err:
-	/*
-	 * Attempt to reset the controller's state. Likely no
-	 * communication can be established until the host
-	 * performs a port reset.
-	 */
-	if (dwc->softconnect)
-		dwc3_gadget_soft_connect(dwc);
-
-	return ret;
 }
 
 int dwc3_gadget_resume(struct dwc3 *dwc)
 {
+	int			ret;
+
 	if (!dwc->gadget_driver || !dwc->softconnect)
 		return 0;
 
-	return dwc3_gadget_soft_connect(dwc);
+	ret = __dwc3_gadget_start(dwc);
+	if (ret < 0)
+		goto err0;
+
+	ret = dwc3_gadget_run_stop(dwc, true);
+	if (ret < 0)
+		goto err1;
+
+	return 0;
+
+err1:
+	__dwc3_gadget_stop(dwc);
+
+err0:
+	return ret;
 }
 
 void dwc3_gadget_process_pending_events(struct dwc3 *dwc)

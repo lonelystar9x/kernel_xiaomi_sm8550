@@ -3627,6 +3627,7 @@ static int stmmac_request_irq_multi_msi(struct net_device *dev)
 	/* Request the Wake IRQ in case of another line
 	 * is used for WoL
 	 */
+	priv->wol_irq_disabled = true;
 	if (priv->wol_irq > 0 && priv->wol_irq != dev->irq) {
 		int_name = priv->int_name_wol;
 		sprintf(int_name, "%s:%s", dev->name, "wol");
@@ -5988,11 +5989,6 @@ static irqreturn_t stmmac_mac_interrupt(int irq, void *dev_id)
 	struct net_device *dev = (struct net_device *)dev_id;
 	struct stmmac_priv *priv = netdev_priv(dev);
 
-	if (unlikely(!dev)) {
-		netdev_err(priv->dev, "%s: invalid dev pointer\n", __func__);
-		return IRQ_NONE;
-	}
-
 	/* Check if adapter is up */
 	if (test_bit(STMMAC_DOWN, &priv->state))
 		return IRQ_HANDLED;
@@ -6007,11 +6003,6 @@ static irqreturn_t stmmac_safety_interrupt(int irq, void *dev_id)
 {
 	struct net_device *dev = (struct net_device *)dev_id;
 	struct stmmac_priv *priv = netdev_priv(dev);
-
-	if (unlikely(!dev)) {
-		netdev_err(priv->dev, "%s: invalid dev pointer\n", __func__);
-		return IRQ_NONE;
-	}
 
 	/* Check if adapter is up */
 	if (test_bit(STMMAC_DOWN, &priv->state))
@@ -6031,11 +6022,6 @@ static irqreturn_t stmmac_msi_intr_tx(int irq, void *data)
 	int status;
 
 	priv = container_of(tx_q, struct stmmac_priv, tx_queue[chan]);
-
-	if (unlikely(!data)) {
-		netdev_err(priv->dev, "%s: invalid dev pointer\n", __func__);
-		return IRQ_NONE;
-	}
 
 	/* Check if adapter is up */
 	if (test_bit(STMMAC_DOWN, &priv->state))
@@ -6074,11 +6060,6 @@ static irqreturn_t stmmac_msi_intr_rx(int irq, void *data)
 	struct stmmac_priv *priv;
 
 	priv = container_of(rx_q, struct stmmac_priv, rx_queue[chan]);
-
-	if (unlikely(!data)) {
-		netdev_err(priv->dev, "%s: invalid dev pointer\n", __func__);
-		return IRQ_NONE;
-	}
 
 	/* Check if adapter is up */
 	if (test_bit(STMMAC_DOWN, &priv->state))
@@ -7377,6 +7358,9 @@ int stmmac_dvr_probe(struct device *device,
 	if (ret == -ENOTSUPP)
 		dev_err(priv->device, "unable to bring out of ahb reset: %pe\n",
 			ERR_PTR(ret));
+
+	/* Wait a bit for the reset to take effect */
+	udelay(10);
 
 	/* Init MAC and get the capabilities */
 	ret = stmmac_hw_init(priv);
